@@ -472,7 +472,8 @@ fn backoff_file_move() -> backon::ExponentialBackoff {
     // of 2), so 10 seconds overall.
     backon::ExponentialBuilder::default()
         .with_min_delay(std::time::Duration::from_millis(10))
-        .with_max_times(10)
+        .with_max_delay(std::time::Duration::from_secs(2))
+        .with_max_times(20)
         .build()
 }
 
