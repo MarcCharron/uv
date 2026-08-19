@@ -1,9 +1,23 @@
 use std::io;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
+#[cfg(windows)]
+use std::time::Duration;
 
+#[cfg(windows)]
+use backon::BlockingRetryable;
 use fs_err::File;
 use thiserror::Error;
+#[cfg(windows)]
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_OPEN_FAILED, ERROR_SHARING_VIOLATION,
+};
+#[cfg(windows)]
+use windows::Win32::System::LibraryLoader::{
+    BeginUpdateResourceW, EndUpdateResourceW, UpdateResourceW,
+};
 
 use uv_fs::Simplified;
 
@@ -288,16 +302,11 @@ fn get_launcher_bin(gui: bool) -> Result<&'static [u8], Error> {
 }
 
 #[cfg(windows)]
-fn retry_begin_update_resource<T>(
-    operation: impl FnMut() -> windows::core::Result<T>,
-) -> windows::core::Result<T> {
-    use std::time::Duration;
-
-    use backon::BlockingRetryable;
-    use windows::Win32::Foundation::E_ACCESSDENIED;
-
-    // Antivirus and endpoint security software can briefly deny access after the PE is created.
-    // Only retry acquiring the update handle; resource updates and the final commit run once.
+fn retry_resource_update(
+    operation: impl FnMut() -> windows::core::Result<()>,
+) -> windows::core::Result<()> {
+    // Antivirus and endpoint security software can briefly lock a PE after it is created. Retry the
+    // complete resource update transaction so failures while committing the changes are covered.
     operation
         .retry(
             backon::ExponentialBuilder::default()
@@ -306,52 +315,68 @@ fn retry_begin_update_resource<T>(
                 .with_max_times(20),
         )
         .sleep(std::thread::sleep)
-        .when(|err| err.code() == E_ACCESSDENIED)
+        .when(|err| {
+            let code = err.code();
+            [
+                ERROR_ACCESS_DENIED,
+                ERROR_SHARING_VIOLATION,
+                ERROR_LOCK_VIOLATION,
+                ERROR_OPEN_FAILED,
+            ]
+            .into_iter()
+            .any(|error| code == windows::core::HRESULT::from_win32(error.0))
+        })
         .call()
 }
 
 /// Helper to write Windows PE resources
 #[cfg(windows)]
 fn write_resources(path: &Path, resources: &[(windows::core::PCWSTR, &[u8])]) -> Result<(), Error> {
-    // SAFETY: winapi calls; null-terminated strings
-    #[allow(unsafe_code)]
-    unsafe {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::Win32::System::LibraryLoader::{
-            BeginUpdateResourceW, EndUpdateResourceW, UpdateResourceW,
-        };
-
-        let map_err = |err: windows::core::Error| Error::WriteResources {
-            path: path.to_path_buf(),
-            err: io::Error::from_raw_os_error(err.code().0),
-        };
-
-        let path_str = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let handle = retry_begin_update_resource(|| {
-            BeginUpdateResourceW(windows::core::PCWSTR(path_str.as_ptr()), false)
-        })
-        .map_err(map_err)?;
-
-        for (name, data) in resources {
-            UpdateResourceW(
-                handle,
-                windows::core::PCWSTR(RT_RCDATA as *const _),
+    let resources = resources
+        .iter()
+        .map(|(name, data)| {
+            Ok((
                 *name,
-                0,
-                Some(data.as_ptr().cast()),
+                *data,
                 u32::try_from(data.len()).map_err(|_| Error::ResourceTooLarge)?,
-            )
-            .map_err(&map_err)?;
+            ))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let path_str = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    retry_resource_update(|| {
+        // SAFETY: `path_str` is null-terminated, the resource pointers remain valid for the
+        // duration of each call, and the update handle is either committed or discarded.
+        #[allow(unsafe_code)]
+        unsafe {
+            let handle = BeginUpdateResourceW(windows::core::PCWSTR(path_str.as_ptr()), false)?;
+
+            for (name, data, size) in &resources {
+                if let Err(err) = UpdateResourceW(
+                    handle,
+                    windows::core::PCWSTR(RT_RCDATA as *const _),
+                    *name,
+                    0,
+                    Some(data.as_ptr().cast()),
+                    *size,
+                ) {
+                    // Preserve the update error; discarding is only cleanup for the next attempt.
+                    let _ = EndUpdateResourceW(handle, true);
+                    return Err(err);
+                }
+            }
+
+            EndUpdateResourceW(handle, false)
         }
-
-        EndUpdateResourceW(handle, false).map_err(map_err)?;
-    }
-
-    Ok(())
+    })
+    .map_err(|err| Error::WriteResources {
+        path: path.to_path_buf(),
+        err: io::Error::from_raw_os_error(err.code().0),
+    })
 }
 
 /// Safely reads a resource from a PE file
@@ -522,7 +547,6 @@ pub fn windows_python_launcher(
 #[cfg(all(test, windows))]
 #[expect(clippy::print_stdout)]
 mod test {
-    use std::cell::Cell;
     use std::io::Write;
     use std::path::Path;
     use std::path::PathBuf;
@@ -532,8 +556,6 @@ mod test {
     use assert_cmd::prelude::OutputAssertExt;
     use assert_fs::prelude::PathChild;
     use fs_err::File;
-    use windows::Win32::Foundation::{E_ACCESSDENIED, E_NOTIMPL};
-
     use which::which;
 
     use super::{
