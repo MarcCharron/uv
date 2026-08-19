@@ -34,6 +34,7 @@ thiserror = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 async_zip = { workspace = true }
+backon = { workspace = true }
 futures-lite = { workspace = true }
 windows = { workspace = true }
 

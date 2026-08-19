@@ -7634,6 +7634,7 @@ dependencies = [
  "assert_cmd",
  "assert_fs",
  "astral_async_zip",
+ "backon",
  "fs-err",
  "futures-lite",
  "goblin",

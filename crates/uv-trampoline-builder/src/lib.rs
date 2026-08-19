@@ -287,6 +287,29 @@ fn get_launcher_bin(gui: bool) -> Result<&'static [u8], Error> {
     })
 }
 
+#[cfg(windows)]
+fn retry_begin_update_resource<T>(
+    operation: impl FnMut() -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    use std::time::Duration;
+
+    use backon::BlockingRetryable;
+    use windows::Win32::Foundation::E_ACCESSDENIED;
+
+    // Antivirus and endpoint security software can briefly deny access after the PE is created.
+    // Only retry acquiring the update handle; resource updates and the final commit run once.
+    operation
+        .retry(
+            backon::ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(10))
+                .with_max_delay(Duration::from_secs(2))
+                .with_max_times(20),
+        )
+        .sleep(std::thread::sleep)
+        .when(|err| err.code() == E_ACCESSDENIED)
+        .call()
+}
+
 /// Helper to write Windows PE resources
 #[cfg(windows)]
 fn write_resources(path: &Path, resources: &[(windows::core::PCWSTR, &[u8])]) -> Result<(), Error> {
@@ -308,8 +331,10 @@ fn write_resources(path: &Path, resources: &[(windows::core::PCWSTR, &[u8])]) ->
             .encode_wide()
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
-        let handle = BeginUpdateResourceW(windows::core::PCWSTR(path_str.as_ptr()), false)
-            .map_err(map_err)?;
+        let handle = retry_begin_update_resource(|| {
+            BeginUpdateResourceW(windows::core::PCWSTR(path_str.as_ptr()), false)
+        })
+        .map_err(map_err)?;
 
         for (name, data) in resources {
             UpdateResourceW(
@@ -497,6 +522,7 @@ pub fn windows_python_launcher(
 #[cfg(all(test, windows))]
 #[expect(clippy::print_stdout)]
 mod test {
+    use std::cell::Cell;
     use std::io::Write;
     use std::path::Path;
     use std::path::PathBuf;
@@ -506,6 +532,7 @@ mod test {
     use assert_cmd::prelude::OutputAssertExt;
     use assert_fs::prelude::PathChild;
     use fs_err::File;
+    use windows::Win32::Foundation::{E_ACCESSDENIED, E_NOTIMPL};
 
     use which::which;
 
